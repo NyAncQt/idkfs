@@ -4,6 +4,7 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -311,6 +312,33 @@ static int32_t idkfs_dir_lookup(IDKFS *fs, Inode *dir_ino, const char *name) {
     if (strncmp(dir.entries[i].name, name, IDKFS_MAX_FILENAME) == 0)
       return (int32_t)dir.entries[i].inode;
   return -1;
+}
+
+static int idkfs_dir_remove(IDKFS *fs, Inode *dir_ino, const char *name) {
+  if (dir_ino->type != IDKFS_FT_DIR)
+    return -ENOTDIR;
+  if (dir_ino->size == 0)
+    return -ENOENT;
+
+  Directory dir;
+  idkfs_read(fs, dir_ino, &dir, sizeof(dir), 0);
+  int32_t idx = -1;
+  for (uint32_t i = 0; i < dir.count; i++) {
+    if (strncmp(dir.entries[i].name, name, IDKFS_MAX_FILENAME) == 0) {
+      idx = (int32_t)i;
+      break;
+    }
+  }
+  if (idx < 0)
+    return -ENOENT;
+
+  for (uint32_t i = (uint32_t)idx; i + 1 < dir.count; i++)
+    dir.entries[i] = dir.entries[i + 1];
+
+  dir.count--;
+  memset(&dir.entries[dir.count], 0, sizeof(DirEntry));
+  idkfs_write(fs, dir_ino, &dir, sizeof(dir), 0);
+  return 0;
 }
 
 static int32_t idkfs_create(IDKFS *fs, uint32_t parent, const char *name,

@@ -1,0 +1,6 @@
+target/
+*.o
+*.img
+*.snapshots
+*.log
+idkfs_fuse

@@ -19,6 +19,10 @@
 #include <assert.h>
 #include <errno.h>
 #include <fuse.h>
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +36,129 @@
 /* ── global fs instance ─────────────────────────────────────── */
 static IDKFS *gfs = NULL;
 
+typedef struct {
+  char name[IDKFS_MAX_FILENAME + 1];
+  const char *type_name;
+  uint64_t size;
+  uint32_t inode;
+  uint8_t entry_type;
+} SortCandidate;
+
+static lua_State *g_sort_L = NULL;
+static int g_sort_compare_ref = LUA_REFNIL;
+static bool g_sort_ready = false;
+static pthread_mutex_t g_sort_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *entry_type_name(uint8_t type) {
+  switch (type) {
+  case IDKFS_FT_DIR:
+    return "dir";
+  case IDKFS_FT_FILE:
+    return "file";
+  case IDKFS_FT_SYMLINK:
+    return "symlink";
+  case IDKFS_FT_DEVICE:
+    return "device";
+  default:
+    return "unknown";
+  }
+}
+
+static void push_candidate_to_lua(lua_State *L, const SortCandidate *entry) {
+  lua_newtable(L);
+  lua_pushstring(L, entry->name);
+  lua_setfield(L, -2, "name");
+  lua_pushinteger(L, (lua_Integer)entry->inode);
+  lua_setfield(L, -2, "inode");
+  lua_pushinteger(L, (lua_Integer)entry->size);
+  lua_setfield(L, -2, "size");
+  lua_pushstring(L, entry->type_name);
+  lua_setfield(L, -2, "type");
+}
+
+static int lua_sort_compare(const void *a, const void *b) {
+  if (!g_sort_ready || !g_sort_L)
+    return 0;
+
+  const SortCandidate *left = (const SortCandidate *)a;
+  const SortCandidate *right = (const SortCandidate *)b;
+
+  pthread_mutex_lock(&g_sort_mutex);
+  lua_rawgeti(g_sort_L, LUA_REGISTRYINDEX, g_sort_compare_ref);
+  push_candidate_to_lua(g_sort_L, left);
+  push_candidate_to_lua(g_sort_L, right);
+  int result = 0;
+  if (lua_pcall(g_sort_L, 2, 1, 0) != LUA_OK) {
+    fprintf(stderr, "idkfs: lua compare error: %s\n", lua_tostring(g_sort_L, -1));
+    lua_pop(g_sort_L, 1);
+    g_sort_ready = false;
+  } else {
+    if (lua_isinteger(g_sort_L, -1))
+      result = (int)lua_tointeger(g_sort_L, -1);
+    lua_pop(g_sort_L, 1);
+  }
+  pthread_mutex_unlock(&g_sort_mutex);
+
+  return result;
+}
+
+static void sorting_shutdown(void) {
+  if (!g_sort_L)
+    return;
+  if (g_sort_compare_ref != LUA_REFNIL)
+    luaL_unref(g_sort_L, LUA_REGISTRYINDEX, g_sort_compare_ref);
+  lua_close(g_sort_L);
+  g_sort_L = NULL;
+  g_sort_ready = false;
+  g_sort_compare_ref = LUA_REFNIL;
+}
+
+static void sorting_log_error(lua_State *L, const char *context) {
+  const char *msg = lua_tostring(L, -1);
+  fprintf(stderr, "idkfs: sorting lua %s: %s\n", context,
+          msg ? msg : "unknown error");
+  lua_pop(L, 1);
+}
+
+static bool sorting_init(void) {
+  if (g_sort_ready)
+    return true;
+
+  const char *path = getenv("IDKFS_SORT_SCRIPT");
+  if (!path)
+    path = "sorting.lua";
+
+  g_sort_L = luaL_newstate();
+  if (!g_sort_L) {
+    fprintf(stderr, "idkfs: failed to initialize Lua for sorting\n");
+    return false;
+  }
+
+  luaL_openlibs(g_sort_L);
+  if (luaL_loadfile(g_sort_L, path) != LUA_OK) {
+    sorting_log_error(g_sort_L, "load failed");
+    sorting_shutdown();
+    return false;
+  }
+  if (lua_pcall(g_sort_L, 0, 0, 0) != LUA_OK) {
+    sorting_log_error(g_sort_L, "execution failed");
+    sorting_shutdown();
+    return false;
+  }
+
+  lua_getglobal(g_sort_L, "compare");
+  if (!lua_isfunction(g_sort_L, -1)) {
+    fprintf(stderr, "idkfs: sorting.lua must export a 'compare(a,b)' function\n");
+    sorting_shutdown();
+    return false;
+  }
+
+  g_sort_compare_ref = luaL_ref(g_sort_L, LUA_REGISTRYINDEX);
+  g_sort_ready = true;
+  printf("idkfs: sorting enabled via '%s'\n", path);
+  return true;
+}
+
 /* ============================================================
  * PATH RESOLUTION — walk path components to find inode
  * ============================================================ */
@@ -42,6 +169,7 @@ static int32_t resolve_path(const char *path) {
 
   char tmp[4096];
   strncpy(tmp, path, sizeof(tmp) - 1);
+  tmp[sizeof(tmp) - 1] = '\0';
 
   uint32_t cur = IDKFS_ROOT_INODE;
   char *tok = strtok(tmp, "/");
@@ -66,12 +194,14 @@ static int resolve_parent(const char *path, uint32_t *parent_out,
                           char *name_out) {
   char tmp[4096];
   strncpy(tmp, path, sizeof(tmp) - 1);
+  tmp[sizeof(tmp) - 1] = '\0';
 
   char *slash = strrchr(tmp, '/');
   if (!slash)
     return -ENOENT;
 
   strncpy(name_out, slash + 1, IDKFS_MAX_FILENAME);
+  name_out[IDKFS_MAX_FILENAME] = '\0';
 
   if (slash == tmp) {
     *parent_out = IDKFS_ROOT_INODE;
@@ -145,22 +275,39 @@ static int fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
   Directory dir;
   idkfs_read(gfs, dir_ino, &dir, sizeof(dir), 0);
 
-  for (uint32_t i = 0; i < dir.count; i++) {
+  SortCandidate entries[IDKFS_MAX_DIRENTS];
+  int entry_count = 0;
+
+  for (uint32_t i = 0; i < dir.count && entry_count < IDKFS_MAX_DIRENTS; i++) {
     DirEntry *e = &dir.entries[i];
-    /* skip . and .. — already added */
-    if (strncmp(e->name, ".", IDKFS_MAX_FILENAME) == 0)
-      continue;
-    if (strncmp(e->name, "..", IDKFS_MAX_FILENAME) == 0)
+    if (strncmp(e->name, ".", IDKFS_MAX_FILENAME) == 0 ||
+        strncmp(e->name, "..", IDKFS_MAX_FILENAME) == 0)
       continue;
 
-    char name[IDKFS_MAX_FILENAME + 1];
-    memcpy(name, e->name, e->name_len);
-    name[e->name_len] = '\0';
+    SortCandidate *candidate = &entries[entry_count++];
+    memcpy(candidate->name, e->name, e->name_len);
+    candidate->name[e->name_len] = '\0';
+    candidate->inode = e->inode;
+    candidate->entry_type = e->type;
+    candidate->type_name = entry_type_name(e->type);
+    candidate->size = gfs->inodes[e->inode].size;
+  }
 
+  if (entry_count > 1 && g_sort_ready)
+    qsort(entries, entry_count, sizeof(entries[0]), lua_sort_compare);
+
+  for (int i = 0; i < entry_count; i++) {
+    SortCandidate *candidate = &entries[i];
     struct stat st = {0};
-    st.st_ino = e->inode;
-    st.st_mode = (e->type == IDKFS_FT_DIR) ? S_IFDIR | 0755 : S_IFREG | 0644;
-    filler(buf, name, &st, 0, 0);
+    st.st_ino = candidate->inode;
+    if (candidate->entry_type == IDKFS_FT_DIR)
+      st.st_mode = S_IFDIR | 0755;
+    else if (candidate->entry_type == IDKFS_FT_SYMLINK)
+      st.st_mode = S_IFLNK | 0777;
+    else
+      st.st_mode = S_IFREG | 0644;
+    st.st_size = (off_t)candidate->size;
+    filler(buf, candidate->name, &st, 0, 0);
   }
 
   return 0;
@@ -256,6 +403,12 @@ static int fuse_chmod(const char *path, mode_t mode,
 }
 
 static int fuse_unlink(const char *path) {
+  uint32_t parent;
+  char name[IDKFS_MAX_FILENAME + 1];
+  int ret = resolve_parent(path, &parent, name);
+  if (ret < 0)
+    return ret;
+
   int32_t ino = resolve_path(path);
   if (ino < 0)
     return ino;
@@ -273,8 +426,11 @@ static int fuse_unlink(const char *path) {
     }
   }
 
+  ret = idkfs_dir_remove(gfs, &gfs->inodes[parent], name);
+  if (ret < 0)
+    return ret;
+
   inode_free(gfs, (uint32_t)ino);
-  /* TODO: remove from parent directory — needs dir_remove() */
   return 0;
 }
 
@@ -324,8 +480,13 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  if (gfs->features.sorting)
+    sorting_init();
+
   printf("idkfs: mounting via FUSE...\n");
   int ret = fuse_main(argc, argv, &idkfs_ops, NULL);
+
+  sorting_shutdown();
 
   idkfs_destroy(gfs);
   return ret;
