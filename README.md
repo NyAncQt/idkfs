@@ -1,95 +1,149 @@
-# idkfs — I Don't Know Filesystem
+---
 
-A fast, configurable FUSE filesystem written in C.
+````markdown
+# IDKFS
 
-## stack
-- **C** — core: superblock, inodes, block allocator, VFS
-- **Rust** — daemon + cross-platform layer (coming)
-- **JS** — user config via `idkfs.config.js` (coming)
-- **Lua** — sorting algorithms + runtime hooks (coming)
+IDKFS (I Don’t Know Filesystem) is a custom FUSE-based filesystem written in C, designed for experimentation and modular file management. It supports persistent storage, snapshots, Lua-powered sorting, and flexible configuration via JS and Lua modules. IDKFS is primarily a user-space filesystem, making it easy to test without kernel modifications.
 
-## build
+---
+
+## Features
+
+- **FUSE-based**: Runs entirely in user space without kernel modules.  
+- **Modular architecture**: Easily extend functionality via modules.  
+- **Persistent storage**: Files and metadata are stored in a single image.  
+- **Snapshots**: Supports lightweight snapshots for testing and recovery.  
+- **Lua sorting**: Customize file listing and organization dynamically.  
+- **User-configurable options**: Adjust caching, journaling, and permissions.  
+
+---
+
+## Status
+
+- Stable for testing and experimentation.  
+- Works on Linux x86_64 (CachyOS tested, Linux 6.19+).  
+- `allow_other` requires `/etc/fuse.conf` to be configured.  
+- **Not recommended as the primary filesystem on production machines yet.**  
+
+---
+
+## Installation
+
+1. Clone the repository:
+
 ```bash
-gcc -O2 -Wall -Wextra $(pkg-config --cflags --libs fuse3) $(pkg-config --cflags --libs lua) -pthread -o idkfs_fuse idkfs_fuse.c
+git clone https://github.com/NyAncQt/idkfs.git
+cd idkfs
+````
+
+2. Build the project:
+
+```bash
+make
 ```
 
-## usage
+3. Create a test filesystem image:
+
+```bash
+mkdir ~/idkfs_test
+truncate -s 50M ~/idkfs_test/myfs.img
+```
+
+---
+
+## Usage
+
+1. Create a mount point:
+
 ```bash
 mkdir ~/idkfs_mount
-./idkfs_fuse ~/idkfs_mount
-# unmount
-fusermount3 -u ~/idkfs_mount
 ```
 
-## features
-- speed tiers per file (FAST / NORMAL / SLOW)
-- toggleable journaling, checksums, timestamps, compression
-- configurable via JS (coming)
-- Lua sorting hooks driven by `sorting.lua`
-
-## sorting
-
-`idkfs_fuse` reads `sorting.lua` from the mount directory (or whatever path is
-specified in `IDKFS_SORT_SCRIPT`) and expects a `compare(a, b)` function. Each
-table argument contains `name`, `inode`, `size`, and `type` entries (e.g.,
-`"dir"`/`"file"`/`"symlink"`). The provided script sorts entries by size first,
-then by type, and finally by a case-insensitive name compare so the ordering
-remains deterministic.
-
-## system integration
-
-### Rust helpers
-
-The Rust workspace now builds two helpers:
-
- - `idkfsd` supervises the FUSE process, keeps the mount point alive, exposes
-   `/run/idkfsd.sock`, and manages `<image>.snapshots/` metadata (`list.txt`,
-   `next_id`). Point it at your persistent image and desired mount:
-   `idkfsd --image /var/lib/idkfs/myfs.img --mount /mnt/idkfs`.
-   Pass any extra flags to the underlying FUSE binary via repeated `--fuse-arg`
-   (for example `--fuse-arg --image --fuse-arg /var/lib/idkfs/myfs.img`).
- - `idkfsctl` talks to that socket and provides `create`, `list`, `delete`, and
-   `rollback` commands. `idkfsctl --socket /run/idkfsd.sock create "daily"` keeps
-   the snapshot log consistent with the daemon.
-
-Build them with Cargo:
+2. Mount the filesystem via FUSE:
 
 ```bash
-cargo build --release -p idkfsd
-cargo build --release -p idkfsctl
+./idkfs_fuse -f -o allow_other ~/idkfs_test/myfs.img ~/idkfs_mount
 ```
 
-### Snapper hooks
+* `-f` keeps it in the foreground (useful for debugging).
+* `allow_other` lets all users access the filesystem (requires `/etc/fuse.conf`).
 
-To integrate with Snapper, point its hook commands at `idkfsctl`:
+3. Perform basic file operations:
 
-```ini
-[config]
-CREATE_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock create \"$SNAPPER_DESCRIPTION\""
-LIST_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock list"
-DELETE_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock delete $SNAPPER_NUMBER"
-ROLLBACK_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock rollback $SNAPPER_NUMBER"
+```bash
+touch ~/idkfs_mount/testfile
+echo "hello world" > ~/idkfs_mount/testfile
+cat ~/idkfs_mount/testfile
+# Output: hello world
 ```
 
-Snapper still controls scheduling and cleanup, while the helper copies the
-idkfs image to/from `<image>.snapshots/` (the daemon watches w/ `list.txt`).
+4. Unmount the filesystem:
 
-### Services for systemd & OpenRC
-
-Deploy the unit files from `deploy/`:
-
- - `deploy/idkfsd.service` sources `/etc/idkfsd.conf`, starts `idkfsd`, and
-   restarts it automatically.
- - `deploy/idkfsd.openrc` is the equivalent OpenRC script; it `.`’s the same
-   `/etc/idkfsd.conf`, ensures the mount point exists, and runs `idkfsd` under
-   `supervise`.
-
-Populate `/etc/idkfsd.conf` with:
-
-```
-IDKFS_IMAGE=/var/lib/idkfs/myfs.img
-IDKFS_MOUNT=/mnt/idkfs
+```bash
+fusermount3 -uz ~/idkfs_mount
 ```
 
-Then enable the desired service and let the daemon keep idkfs mounted without
-touching kernel drivers.
+---
+
+## Configuration
+
+* `idkfs.config.js`: Runtime configuration (enable/disable journaling, caching, etc.).
+* `sorting.lua`: Customize file ordering and display logic.
+* `Makefile`: Build settings and optional kernel module compilation.
+
+---
+
+## Options
+
+IDKFS supports the following FUSE and module-specific options:
+
+```
+Usage: ./idkfs [options] <mountpoint>
+
+Options:
+    -h, --help             Show help
+    -V, --version          Show version
+    -f                     Run in foreground (debug)
+    -o allow_other         Allow other users to access
+    -o auto_unmount        Unmount automatically on exit
+    -o io_uring            Enable io_uring support
+    -o subdir=DIR          Prepend this directory to all paths
+    -o from_code=CHARSET   Input encoding for filenames
+    -o to_code=CHARSET     Output encoding for filenames
+```
+
+Refer to `idkfs.config.js` and `sorting.lua` for more fine-grained behavior.
+
+---
+
+## Contributing
+
+* Contributions welcome!
+* Ensure FUSE mounts are tested on Linux x86_64.
+* Include kernel version if testing kernel modules.
+* Submit PRs with clear descriptions and relevant tests.
+
+---
+
+## License
+
+IDKFS is released under the MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## Notes
+
+* Kernel headers are only required if building optional kernel modules.
+* Images can be created using `truncate -s <size>` for quick testing.
+* FUSE is mandatory for user-space operation.
+* Avoid using IDKFS as the root filesystem in production until stable kernel support is added.
+
+```
+
+---
+
+If you want, I can also **write a “Quick Start” cheat sheet section at the very top** that shows a 5-step setup for new users—it makes your GitHub README feel super professional and approachable.  
+
+Do you want me to do that too?
+```
+
