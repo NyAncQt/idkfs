@@ -1,0 +1,17 @@
+[Unit]
+Description=IDKFS user-space filesystem daemon
+After=local-fs.target network.target
+Wants=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/idkfsd.conf
+ExecStart=/usr/local/bin/idkfsd --image /home/cat/projects/c/myfs.img --mount /home/cat/myfs --socket /run/idkfsd.sock --store /home/cat/projects/c/myfs.img.snapshots --fuse-bin /usr/local/bin/idkfs --fuse-arg --image --fuse-arg /home/cat/projects/c/myfs.img
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
