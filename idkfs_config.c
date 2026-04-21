@@ -1,29 +1,15 @@
-/*
- * idkfs_config.c — JS config layer for idkfs using QuickJS
- *
- * Reads idkfs.config.js at mount time and applies:
- *   - feature flags (disable journaling, checksums, etc)
- *   - speed tier rules (which file patterns go to FAST/NORMAL/SLOW)
- *   - sorting algorithm preference
- *
- * Include this AFTER idkfs_core.c, BEFORE idkfs_persist.c / fuse layer.
- *
- * Compile flags needed:
- *   -I/usr/local/include/quickjs -L/usr/local/lib/quickjs -lquickjs -lm -lpthread -ldl
- */
+
 
 #include <quickjs/quickjs.h>
 #include <quickjs/quickjs-libc.h>
 #include <fnmatch.h>
 
-/* ============================================================
- * DEFAULT CONFIG — used if no idkfs.config.js found
- * ============================================================ */
+
 
 #define IDKFS_MAX_TIER_RULES 64
 
 typedef struct {
-    char      pattern[128];   /* glob pattern e.g. "*.so", "*.bin" */
+    char      pattern[128];
     SpeedTier tier;
 } TierRule;
 
@@ -34,8 +20,8 @@ typedef struct {
     int       tier_rule_count;
     SpeedTier default_tier;
 
-    char      sorting[32];    /* "btree", "hashmap", "radix" */
-    bool      loaded;         /* was a config file found? */
+    char      sorting[32];
+    bool      loaded;
 } IDKFSConfig;
 
 static IDKFSConfig g_config = {0};
@@ -46,7 +32,7 @@ static void config_defaults(IDKFSConfig *cfg) {
     cfg->loaded       = false;
     strncpy(cfg->sorting, "btree", sizeof(cfg->sorting)-1);
 
-    /* sensible defaults: binaries fast, archives slow */
+
     int n = 0;
     #define ADD_RULE(pat, t) \
         strncpy(cfg->tier_rules[n].pattern, pat, 127); \
@@ -69,9 +55,7 @@ static void config_defaults(IDKFSConfig *cfg) {
     cfg->tier_rule_count = n;
 }
 
-/* ============================================================
- * TIER LOOKUP — given a filename, return its tier
- * ============================================================ */
+
 
 SpeedTier config_get_tier(IDKFSConfig *cfg, const char *filename) {
     for (int i = 0; i < cfg->tier_rule_count; i++) {
@@ -81,9 +65,7 @@ SpeedTier config_get_tier(IDKFSConfig *cfg, const char *filename) {
     return cfg->default_tier;
 }
 
-/* ============================================================
- * JS HELPERS — read fields from a JS object
- * ============================================================ */
+
 
 static bool js_get_bool(JSContext *ctx, JSValue obj, const char *key, bool fallback) {
     JSValue v = JS_GetPropertyStr(ctx, obj, key);
@@ -101,9 +83,7 @@ static void js_get_str(JSContext *ctx, JSValue obj, const char *key, char *out, 
     JS_FreeValue(ctx, v);
 }
 
-/* ============================================================
- * PARSE CONFIG — read idkfs.config.js via QuickJS
- * ============================================================ */
+
 
 static void parse_disable(JSContext *ctx, JSValue root, FeatureFlags *f) {
     JSValue dis = JS_GetPropertyStr(ctx, root, "disable");
@@ -179,7 +159,7 @@ int idkfs_config_load(IDKFSConfig *cfg, const char *config_path) {
     js_std_init_handlers(rt);
     JS_SetModuleLoaderFunc(rt, NULL, js_module_loader, NULL);
 
-    /* read the file */
+
     size_t buf_len = 0;
     uint8_t *buf = js_load_file(ctx, &buf_len, config_path);
     if (!buf) {
@@ -204,19 +184,23 @@ int idkfs_config_load(IDKFSConfig *cfg, const char *config_path) {
     }
     JS_FreeValue(ctx, result);
 
-    /* get the default export — expected: globalThis.default or just an object named 'config' */
-    JSValue global = JS_GetGlobalObject(ctx);
 
-    /* try 'export default' style — QuickJS global eval puts it in globalThis */
-    JSValue cfg_obj = JS_GetPropertyStr(ctx, global, "default");
-    if (JS_IsUndefined(cfg_obj) || JS_IsException(cfg_obj)) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue cfg_obj = JS_GetPropertyStr(ctx, global, "config");
+    if (JS_IsException(cfg_obj)) {
         JS_FreeValue(ctx, cfg_obj);
-        /* fallback: try 'config' variable */
-        cfg_obj = JS_GetPropertyStr(ctx, global, "config");
+        cfg_obj = JS_UNDEFINED;
+    }
+    if (JS_IsUndefined(cfg_obj)) {
+        cfg_obj = JS_GetPropertyStr(ctx, global, "default");
+        if (JS_IsException(cfg_obj)) {
+            JS_FreeValue(ctx, cfg_obj);
+            cfg_obj = JS_UNDEFINED;
+        }
     }
 
     if (!JS_IsObject(cfg_obj)) {
-        fprintf(stderr, "idkfs: config must export an object (use 'var default = {...}' or 'var config = {...}')\n");
+        fprintf(stderr, "idkfs: config must define a global object named 'config'\n");
         JS_FreeValue(ctx, cfg_obj);
         JS_FreeValue(ctx, global);
         JS_FreeContext(ctx); JS_FreeRuntime(rt);
@@ -241,9 +225,7 @@ int idkfs_config_load(IDKFSConfig *cfg, const char *config_path) {
     return 0;
 }
 
-/* ============================================================
- * PRINT CONFIG — for debugging
- * ============================================================ */
+
 
 void idkfs_config_print(IDKFSConfig *cfg) {
     const char *tier_names[] = {"FAST","NORMAL","SLOW"};

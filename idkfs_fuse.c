@@ -1,18 +1,4 @@
-/*
- * idkfs_fuse.c — FUSE wrapper for idkfs
- *
- * Compile:
- *   gcc -O2 -Wall -Wextra $(pkg-config --cflags --libs fuse3) -o idkfs_fuse
- * idkfs_fuse.c
- *
- * Usage:
- *   mkdir -p /mnt/idkfs
- *   ./idkfs_fuse /mnt/idkfs
- *   ./idkfs_fuse /mnt/idkfs -d   # debug mode, see every call
- *
- * Unmount:
- *   fusermount3 -u /mnt/idkfs
- */
+
 
 #define FUSE_USE_VERSION 31
 
@@ -30,10 +16,10 @@
 #include <string.h>
 #include <time.h>
 
-/* ── pull in the entire core inline ────────────────────────── */
+
 #include "idkfs_core.c"
 
-/* ── global fs instance ─────────────────────────────────────── */
+
 static IDKFS *gfs = NULL;
 
 typedef struct {
@@ -159,9 +145,7 @@ static bool sorting_init(void) {
   return true;
 }
 
-/* ============================================================
- * PATH RESOLUTION — walk path components to find inode
- * ============================================================ */
+
 
 static int32_t resolve_path(const char *path) {
   if (strcmp(path, "/") == 0)
@@ -172,7 +156,8 @@ static int32_t resolve_path(const char *path) {
   tmp[sizeof(tmp) - 1] = '\0';
 
   uint32_t cur = IDKFS_ROOT_INODE;
-  char *tok = strtok(tmp, "/");
+  char *saveptr = NULL;
+  char *tok = strtok_r(tmp, "/", &saveptr);
 
   while (tok) {
     Inode *dir = &gfs->inodes[cur];
@@ -183,13 +168,13 @@ static int32_t resolve_path(const char *path) {
     if (next < 0)
       return -ENOENT;
     cur = (uint32_t)next;
-    tok = strtok(NULL, "/");
+    tok = strtok_r(NULL, "/", &saveptr);
   }
 
   return (int32_t)cur;
 }
 
-/* get parent dir inode + basename from path */
+
 static int resolve_parent(const char *path, uint32_t *parent_out,
                           char *name_out) {
   char tmp[4096];
@@ -215,9 +200,7 @@ static int resolve_parent(const char *path, uint32_t *parent_out,
   return 0;
 }
 
-/* ============================================================
- * FUSE CALLBACKS
- * ============================================================ */
+
 
 static int fuse_getattr(const char *path, struct stat *st,
                         struct fuse_file_info *fi) {
@@ -417,7 +400,7 @@ static int fuse_unlink(const char *path) {
   if (i->type == IDKFS_FT_DIR)
     return -EISDIR;
 
-  /* free all blocks */
+
   for (int b = 0; b < IDKFS_DIRECT_BLOCKS; b++) {
     if (i->direct[b] != IDKFS_NULL_BLOCK) {
       bitmap_clear(&gfs->bitmap, i->direct[b]);
@@ -425,6 +408,24 @@ static int fuse_unlink(const char *path) {
       i->direct[b] = IDKFS_NULL_BLOCK;
     }
   }
+
+  if (i->indirect1 != IDKFS_NULL_BLOCK) {
+    uint32_t ppb = IDKFS_BLOCK_SIZE / sizeof(uint32_t);
+    uint32_t ptrs[ppb];
+    block_read(gfs, i->indirect1, ptrs);
+    for (uint32_t p = 0; p < ppb; p++) {
+      if (ptrs[p] != IDKFS_NULL_BLOCK) {
+        bitmap_clear(&gfs->bitmap, ptrs[p]);
+        gfs->sb.free_blocks++;
+        ptrs[p] = IDKFS_NULL_BLOCK;
+      }
+    }
+    bitmap_clear(&gfs->bitmap, i->indirect1);
+    gfs->sb.free_blocks++;
+    i->indirect1 = IDKFS_NULL_BLOCK;
+  }
+  i->size = 0;
+  i->block_count = 0;
 
   ret = idkfs_dir_remove(gfs, &gfs->inodes[parent], name);
   if (ret < 0)
@@ -448,9 +449,7 @@ static int fuse_statfs(const char *path, struct statvfs *st) {
   return 0;
 }
 
-/* ============================================================
- * FUSE OPS TABLE
- * ============================================================ */
+
 
 static const struct fuse_operations idkfs_ops = {
     .getattr = fuse_getattr,
@@ -467,9 +466,7 @@ static const struct fuse_operations idkfs_ops = {
     .statfs = fuse_statfs,
 };
 
-/* ============================================================
- * MAIN
- * ============================================================ */
+
 
 int main(int argc, char *argv[]) {
   printf("idkfs: initializing...\n");

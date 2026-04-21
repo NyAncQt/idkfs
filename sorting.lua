@@ -1,6 +1,6 @@
--- sorting.lua — Lua comparator for idkfs directory listings
--- Sort by file size first, then by type (dir/file/symlink/device/unknown),
--- and finally by a case-insensitive name order so listings stay deterministic.
+
+
+
 
 local type_order = {
   dir = 0,

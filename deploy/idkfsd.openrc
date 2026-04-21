@@ -7,7 +7,7 @@ fi
 [ -n "${IDKFS_MOUNT}" ] || { eerror "set IDKFS_MOUNT in /etc/idkfsd.conf"; return 1; }
 
 command=/usr/local/bin/idkfsd
-command_args="--image ${IDKFS_IMAGE} --mount ${IDKFS_MOUNT} --socket /run/idkfsd.sock --store ${IDKFS_IMAGE}.snapshots --fuse-bin /usr/local/bin/idkfs --fuse-arg --image --fuse-arg ${IDKFS_IMAGE}"
+command_args="--image ${IDKFS_IMAGE} --mount ${IDKFS_MOUNT} --socket 127.0.0.1:12345 --store ${IDKFS_IMAGE}.snapshots --fuse-bin /usr/local/bin/idkfs --fuse-arg --image --fuse-arg ${IDKFS_IMAGE}"
 pidfile=/run/idkfsd.pid
 supervisor=supervise
 

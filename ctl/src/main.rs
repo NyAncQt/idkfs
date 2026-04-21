@@ -1,36 +1,35 @@
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::net::TcpStream;
 
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
-    /// Unix-domain socket that idkfsd listens on
-    #[arg(short, long, default_value = "/run/idkfsd.sock")]
-    socket: PathBuf,
+
+    #[arg(short, long, default_value = "127.0.0.1:12345")]
+    socket: String,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a snapshot with an optional description
+
     Create {
-        /// Snapshot description
+
         #[arg(value_name = "TEXT")]
         desc: Option<String>,
     },
-    /// List available snapshots
+
     List,
-    /// Delete a snapshot by ID
+
     Delete {
-        /// Snapshot ID (numeric)
+
         id: u32,
     },
-    /// Roll back the main image to a snapshot
+
     Rollback {
-        /// Snapshot ID (numeric)
+
         id: u32,
     },
 }
@@ -38,7 +37,7 @@ enum Command {
 fn main() -> io::Result<()> {
     let args = Args::parse();
     let command = args.command;
-    let stream = UnixStream::connect(&args.socket)?;
+    let stream = TcpStream::connect(&args.socket)?;
     let mut writer = BufWriter::new(&stream);
     let message = match &command {
         Command::Create { desc } => format!("create|{}\n", desc.clone().unwrap_or_default()),
@@ -60,10 +59,10 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // print any remaining lines from the daemon
+
     if command.matches_list_response() || command.matches_create_response() {
-        for resp in reader.lines() {
-            let resp = resp?;
+        for result in reader.lines() {
+            let resp = result?;
             if resp.is_empty() {
                 continue;
             }

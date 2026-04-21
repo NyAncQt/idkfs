@@ -1,37 +1,4 @@
-/*
- * idkfs_blk.c — kernel block device backed by an idkfs image
- *
- * TODO: This module exposes the contents of a mmap'ed backing file
- * (default "myfs.img") as /dev/idkfsblk (dynamic major). It handles
- * read/write requests directly against the mapped memory region,
- * provides journaling stubs, and ships helper functions that illustrate
- * how a stage-1 ELF bootloader can load a kernel from the first blocks of
- * the filesystem (bootloader guidance is in the big comment below).
- *
- * Bootloader integration outline:
- *   1. Reserve the first few filesystem blocks (MBR / BIOS) for a
- *      tiny ELF stage-1 loader. That loader lives in the first 512-byte
- *      sectors and is linked to load with identity-mapped physical
- *      addresses (e.g. loaded at 0x7C00).
- *   2. Stage-1 reads the custom superblock placed at block 1 (offset
- *      4096, following our superblock layout). The superblock contains
- *      metadata: location of the root inode, pointers to the kernel file,
- *      and the layout of indirect tables. The loader can map the stage-1
- *      inode metadata to find where the kernel binary starts.
- *   3. Once the kernel inode and block pointers are known, stage-1 loads
- *      the ELF program headers directly from idkfs (following multi-level
- *      pointers) into memory, patches relocation entries if necessary,
- *      and jumps to the kernel entry point.
- *
- *   Multi-stage boot testing in QEMU:
- *     - Build the kernel ELF and place it into idkfs via tools that understand
- *       the superblock layout (or mount idkfs in userspace and copy files).
- *     - Create a small stage-1 binary that knows how to read the superblock
- *       and load the kernel; place it in the first sectors of the image.
- *     - Launch QEMU with this image and chainload the stage-1 stub (e.g.,
- *       qemu-system-x86_64 -drive file=myfs.img,format=raw,if=ide).
- */
-
+#ifdef __KERNEL__
 #include <linux/bio.h>
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
@@ -49,12 +16,13 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
+#include "idkfs_kfs.h"
 
 MODULE_AUTHOR("idkfs team");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Block driver that maps an idkfs image with journaling stubs");
 
-/*------------------------------------------------------------------------*/
+
 #define IDKFS_BLOCK_SIZE 4096
 #define IDKFS_DIRECT_BLOCKS 12
 #define IDKFS_MAX_INDIRECT_LEVELS 6
@@ -168,7 +136,7 @@ struct idkfs_blk_device {
 	struct request_queue *queue;
 	struct gendisk *gd;
 	spinlock_t queue_lock;
-	/* journaling placeholder */
+
 	struct delayed_work journal_work;
 	bool journal_dirty;
 };
@@ -178,9 +146,40 @@ static void *backing_map;
 static resource_size_t backing_size;
 static int idkfs_major = 0;
 static struct idkfs_blk_device *idkfs_dev;
+static struct idkfs_super_block *idkfs_sb(void)
+{
+	return (struct idkfs_super_block *)backing_map;
+}
+static struct idkfs_tx_record *idkfs_tx(void)
+{
+	struct idkfs_super_block *sb;
+	u64 tx_block;
+	if (!backing_map)
+		return NULL;
+	sb = idkfs_sb();
+	tx_block = le64_to_cpu(sb->tx_region_block);
+	return (struct idkfs_tx_record *)(backing_map + (tx_block * IDKFS_BLOCK_SIZE));
+}
+static void idkfs_replay_if_needed(void)
+{
+	struct idkfs_tx_record *tx = idkfs_tx();
+	struct idkfs_super_block *sb = idkfs_sb();
+	u32 state;
+	if (!tx || !sb)
+		return;
+	if (le32_to_cpu(tx->magic) != IDKFS_TX_MAGIC)
+		return;
+	state = le32_to_cpu(tx->state);
+	if (state == 1) {
+		sb->generation = tx->committed_generation;
+		tx->state = cpu_to_le32(0);
+		pr_warn("idkfs: recovered incomplete tx, rolled back to generation %llu\n",
+			(unsigned long long)le64_to_cpu(sb->generation));
+	}
+}
 
-/*------------------------------------------------------------------------*/
-/* journaling stubs */
+
+
 static void idkfs_log_entry(sector_t sector, unsigned int len, bool is_write)
 {
 	pr_debug("%s: journal log entry sector=%llu len=%u write=%d\n", __func__,
@@ -189,12 +188,36 @@ static void idkfs_log_entry(sector_t sector, unsigned int len, bool is_write)
 
 static void idkfs_commit(struct work_struct *work)
 {
+	loff_t pos = 0;
+	ssize_t written;
+
 	if (!idkfs_dev)
 		return;
 
 	if (idkfs_dev->journal_dirty) {
-		pr_info("idkfs: committing journal (dummy)\n");
-		idkfs_dev->journal_dirty = false;
+		struct idkfs_tx_record *tx = idkfs_tx();
+		struct idkfs_super_block *sb = idkfs_sb();
+		u64 next_gen = 0;
+		if (tx && sb && le32_to_cpu(tx->magic) == IDKFS_TX_MAGIC) {
+			next_gen = le64_to_cpu(sb->generation) + 1;
+			tx->pending_generation = cpu_to_le64(next_gen);
+			tx->state = cpu_to_le32(1);
+		}
+		written = kernel_write(backing_file, backing_map, backing_size, &pos);
+		if (written != (ssize_t)backing_size) {
+			pr_err("idkfs: journal flush failed (%zd/%llu)\n", written,
+			       (unsigned long long)backing_size);
+		} else {
+			if (tx && sb && le32_to_cpu(tx->magic) == IDKFS_TX_MAGIC) {
+				if (next_gen == 0)
+					next_gen = le64_to_cpu(sb->generation) + 1;
+				sb->generation = cpu_to_le64(next_gen);
+				tx->committed_generation = cpu_to_le64(next_gen);
+				tx->state = cpu_to_le32(0);
+			}
+			vfs_fsync(backing_file, 0);
+			idkfs_dev->journal_dirty = false;
+		}
 	}
 
 	schedule_delayed_work(&idkfs_dev->journal_work, msecs_to_jiffies(250));
@@ -206,12 +229,12 @@ static void idkfs_rollback(void)
 	idkfs_dev->journal_dirty = false;
 }
 
-/*------------------------------------------------------------------------*/
+
 static int idkfs_map_backing(void)
 {
 	struct kstat st;
-	mm_segment_t old_fs;
-	unsigned long addr;
+	loff_t pos = 0;
+	ssize_t got;
 
 	backing_file = filp_open(backing_path, O_RDWR | O_LARGEFILE, 0);
 	if (IS_ERR(backing_file))
@@ -230,18 +253,24 @@ static int idkfs_map_backing(void)
 		return -EINVAL;
 	}
 
-	old_fs = get_fs();
-	set_fs(KERNEL_DS);
-	addr = vm_mmap(NULL, 0, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED, backing_file, 0);
-	set_fs(old_fs);
-
-	if (IS_ERR_VALUE(addr)) {
-		pr_err("idkfs: vm_mmap failed (%ld)\n", (long)addr);
+	backing_map = vmalloc(backing_size);
+	if (!backing_map) {
+		pr_err("idkfs: vmalloc failed for backing map\n");
 		filp_close(backing_file, NULL);
-		return addr;
+		return -ENOMEM;
 	}
 
-	backing_map = (void *)addr;
+	got = kernel_read(backing_file, backing_map, backing_size, &pos);
+	if (got != (ssize_t)backing_size) {
+		pr_err("idkfs: kernel_read failed (%zd/%llu)\n", got,
+		       (unsigned long long)backing_size);
+		vfree(backing_map);
+		backing_map = NULL;
+		filp_close(backing_file, NULL);
+		return got < 0 ? (int)got : -EIO;
+	}
+	idkfs_replay_if_needed();
+
 	pr_info("idkfs: mapped '%s' (%llu bytes) at %p\n", backing_path,
 		(unsigned long long)backing_size, backing_map);
 	return 0;
@@ -250,7 +279,7 @@ static int idkfs_map_backing(void)
 static void idkfs_unmap_backing(void)
 {
 	if (backing_map)
-		vm_munmap((unsigned long)backing_map, backing_size);
+		vfree(backing_map);
 	if (backing_file)
 		filp_close(backing_file, NULL);
 	backing_map = NULL;
@@ -258,7 +287,7 @@ static void idkfs_unmap_backing(void)
 	backing_size = 0;
 }
 
-/*------------------------------------------------------------------------*/
+
 static blk_status_t idkfs_blk_dispatch(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
@@ -310,14 +339,14 @@ static blk_status_t idkfs_blk_dispatch(struct blk_mq_hw_ctx *hctx,
 
 done:
 	blk_mq_end_request(req, status);
-	return BLK_STS_OK;
+	return status;
 }
 
 static const struct blk_mq_ops idkfs_mq_ops = {
 	.queue_rq = idkfs_blk_dispatch,
 };
 
-/*------------------------------------------------------------------------*/
+
 static int idkfs_blk_init_disk(void)
 {
 	int ret;
@@ -357,7 +386,7 @@ cleanup_queue:
 	return ret;
 }
 
-/*------------------------------------------------------------------------*/
+
 static int __init idkfs_blk_init(void)
 {
 	int ret;
@@ -437,3 +466,9 @@ static void __exit idkfs_blk_exit(void)
 
 module_init(idkfs_blk_init);
 module_exit(idkfs_blk_exit);
+#else
+/*
+ * Linux kernel module source: host-side stub for non-kernel tooling.
+ */
+int idkfs_blk_host_stub;
+#endif

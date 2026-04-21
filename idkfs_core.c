@@ -1,7 +1,4 @@
-/*
- * idkfs_core.c — I Don't Know Filesystem
- * NOTE: no main() — included by idkfs_fuse.c
- */
+
 
 #include <assert.h>
 #include <errno.h>
@@ -23,6 +20,7 @@
 #define IDKFS_ROOT_INODE 0
 #define IDKFS_NULL_BLOCK UINT32_MAX
 #define IDKFS_NULL_INODE UINT32_MAX
+#define IDKFS_PTRS_PER_BLOCK (IDKFS_BLOCK_SIZE / sizeof(uint32_t))
 
 typedef enum { TIER_FAST = 0, TIER_NORMAL = 1, TIER_SLOW = 2 } SpeedTier;
 typedef enum {
@@ -94,10 +92,13 @@ typedef struct {
   Superblock sb;
   BlockBitmap bitmap;
   Inode inodes[IDKFS_MAX_INODES];
+  uint32_t block_csum[IDKFS_TOTAL_BLOCKS];
+  uint32_t block_mirror[IDKFS_TOTAL_BLOCKS];
   uint8_t *disk;
   size_t disk_size;
   FeatureFlags features;
   bool dirty;
+  bool redundancy_enabled;
 } IDKFS;
 
 static uint32_t crc32_table[256];

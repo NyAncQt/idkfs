@@ -1,26 +1,4 @@
-/*
- * idkfs_persist.c — persistence layer for idkfs
- * replaces RAM buffer with a real file on disk via mmap
- *
- * Compile:
- *   gcc -O2 -Wall -Wextra $(pkg-config --cflags --libs fuse3) -o idkfs
- * idkfs_persist.c
- *
- * Usage:
- *   # create a new 256MB filesystem image
- *   ./idkfs --mkfs idkfs.img
- *
- *   # mount an existing image
- *   mkdir -p ~/idkfs_mount
- *   ./idkfs --image idkfs.img ~/idkfs_mount
- *
- *   # unmount
- *   fusermount3 -u ~/idkfs_mount
- *
- * The image file is a flat binary — the entire fs lives in it.
- * mmap keeps it synced to disk automatically.
- */
-
+#ifdef __linux__
 #define FUSE_USE_VERSION 31
 #define _GNU_SOURCE
 
@@ -38,27 +16,25 @@
 #include <time.h>
 #include <unistd.h>
 
-/* pull in core (no main) */
+
 #include "idkfs_core.c"
 
-/* ============================================================
- * DISK IMAGE — mmap based persistence
- * ============================================================ */
+
 
 #define IDKFS_IMAGE_SIZE                                                       \
-  ((size_t)IDKFS_TOTAL_BLOCKS * IDKFS_BLOCK_SIZE) /* 256MB */
+  ((size_t)IDKFS_TOTAL_BLOCKS * IDKFS_BLOCK_SIZE)
 
 typedef struct {
   int fd;
   char path[4096];
-  uint8_t *map; /* mmap pointer */
+  uint8_t *map;
   size_t size;
 } DiskImage;
 
 static DiskImage g_image = {0};
 static IDKFS *gfs = NULL;
 
-/* create a new blank image file */
+
 static int image_create(const char *path) {
   int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
@@ -66,7 +42,7 @@ static int image_create(const char *path) {
     return -1;
   }
 
-  /* extend file to full size */
+
   if (ftruncate(fd, (off_t)IDKFS_IMAGE_SIZE) < 0) {
     perror("ftruncate");
     close(fd);
@@ -79,7 +55,7 @@ static int image_create(const char *path) {
   return 0;
 }
 
-/* open and mmap an existing image */
+
 static int image_open(DiskImage *img, const char *path) {
   img->fd = open(path, O_RDWR);
   if (img->fd < 0) {
@@ -116,13 +92,13 @@ static int image_open(DiskImage *img, const char *path) {
     return 0;
 }
 
-/* sync mmap to disk explicitly */
+
 static void image_sync(DiskImage *img) {
     if (!img->map) return;
     msync(img->map, img->size, MS_ASYNC);
 }
 
-/* close and unmap */
+
 static void image_close(DiskImage *img) {
     if (!img->map) return;
     msync(img->map, img->size, MS_SYNC);
@@ -133,23 +109,20 @@ static void image_close(DiskImage *img) {
     printf("idkfs: image synced and closed\n");
 }
 
-/* ============================================================
- * IDKFS INIT WITH MMAP BACKING
- * instead of calloc, point fs->disk at the mmap region
- * ============================================================ */
+
 
 static IDKFS *idkfs_mount_image(DiskImage *img, bool is_new) {
     IDKFS *fs = calloc(1, sizeof(IDKFS));
     if (!fs) return NULL;
 
-    /* point disk buffer at mmap — no copy, writes go straight to file */
+
     fs->disk      = img->map;
     fs->disk_size = img->size;
     fs->features  = features_default();
     fs->dirty     = false;
 
     if (is_new) {
-        /* format fresh filesystem */
+
         uint32_t inode_blocks = (IDKFS_MAX_INODES * sizeof(Inode) + IDKFS_BLOCK_SIZE - 1) / IDKFS_BLOCK_SIZE;
         uint32_t data_start   = 2 + inode_blocks;
 
@@ -175,19 +148,19 @@ static IDKFS *idkfs_mount_image(DiskImage *img, bool is_new) {
         idkfs_dir_add(fs, root, ".",  IDKFS_ROOT_INODE, IDKFS_FT_DIR);
         idkfs_dir_add(fs, root, "..", IDKFS_ROOT_INODE, IDKFS_FT_DIR);
 
-        /* flush in-memory structs to mmap */
+
         idkfs_flush(fs);
         image_sync(img);
         printf("idkfs: formatted new filesystem\n");
     } else {
-        /* load existing fs from mmap */
+
         Superblock *sb_on_disk = (Superblock *)img->map;
         if (sb_on_disk->magic != IDKFS_MAGIC) {
             fprintf(stderr, "idkfs: bad magic — not an idkfs image (got 0x%08X)\n", sb_on_disk->magic);
             free(fs); return NULL;
         }
 
-        /* read superblock, bitmap, inodes from disk into fs structs */
+
         memcpy(&fs->sb,     img->map,                          sizeof(Superblock));
         memcpy(&fs->bitmap, img->map + IDKFS_BLOCK_SIZE,       sizeof(BlockBitmap));
         memcpy(fs->inodes,  img->map + 2*IDKFS_BLOCK_SIZE,     sizeof(fs->inodes));
@@ -201,7 +174,7 @@ static IDKFS *idkfs_mount_image(DiskImage *img, bool is_new) {
     return fs;
 }
 
-/* flush in-memory fs state back to mmap (and thus to disk) */
+
 static void idkfs_flush_to_image(IDKFS *fs, DiskImage *img) {
     memcpy(img->map,                      &fs->sb,     sizeof(Superblock));
     memcpy(img->map + IDKFS_BLOCK_SIZE,   &fs->bitmap, sizeof(BlockBitmap));
@@ -209,31 +182,35 @@ static void idkfs_flush_to_image(IDKFS *fs, DiskImage *img) {
     image_sync(img);
 }
 
-/* ============================================================
- * PATH RESOLUTION
- * ============================================================ */
+
 
 static int32_t resolve_path(const char *path) {
     if (strcmp(path, "/") == 0) return IDKFS_ROOT_INODE;
-    char tmp[4096]; strncpy(tmp, path, sizeof(tmp)-1);
+    char tmp[4096];
+    strncpy(tmp, path, sizeof(tmp)-1);
+    tmp[sizeof(tmp)-1] = '\0';
     uint32_t cur = IDKFS_ROOT_INODE;
-    char *tok = strtok(tmp, "/");
+    char *saveptr = NULL;
+    char *tok = strtok_r(tmp, "/", &saveptr);
     while (tok) {
         Inode *dir = &gfs->inodes[cur];
         if (dir->type != IDKFS_FT_DIR) return -ENOTDIR;
         int32_t next = idkfs_dir_lookup(gfs, dir, tok);
         if (next < 0) return -ENOENT;
         cur = (uint32_t)next;
-        tok = strtok(NULL, "/");
+        tok = strtok_r(NULL, "/", &saveptr);
     }
     return (int32_t)cur;
 }
 
 static int resolve_parent(const char *path, uint32_t *parent_out, char *name_out) {
-    char tmp[4096]; strncpy(tmp, path, sizeof(tmp)-1);
+    char tmp[4096];
+    strncpy(tmp, path, sizeof(tmp)-1);
+    tmp[sizeof(tmp)-1] = '\0';
     char *slash = strrchr(tmp, '/');
     if (!slash) return -ENOENT;
     strncpy(name_out, slash+1, IDKFS_MAX_FILENAME);
+    name_out[IDKFS_MAX_FILENAME] = '\0';
     if (slash == tmp) { *parent_out = IDKFS_ROOT_INODE; }
     else {
         *slash = '\0';
@@ -244,9 +221,7 @@ static int resolve_parent(const char *path, uint32_t *parent_out, char *name_out
     return 0;
 }
 
-/* ============================================================
- * FUSE CALLBACKS
- * ============================================================ */
+
 
 static int fuse_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
     (void)fi;
@@ -342,6 +317,10 @@ static int fuse_mkdir(const char *path, mode_t mode) {
 }
 
 static int fuse_unlink(const char *path) {
+    uint32_t parent;
+    char name[IDKFS_MAX_FILENAME+1];
+    int ret = resolve_parent(path, &parent, name);
+    if (ret < 0) return ret;
     int32_t ino = resolve_path(path);
     if (ino < 0) return ino;
     Inode *i = &gfs->inodes[ino];
@@ -353,6 +332,26 @@ static int fuse_unlink(const char *path) {
             i->direct[b] = IDKFS_NULL_BLOCK;
         }
     }
+    if (i->indirect1 != IDKFS_NULL_BLOCK) {
+        uint32_t ppb = IDKFS_BLOCK_SIZE / sizeof(uint32_t);
+        uint32_t ptrs[ppb];
+        block_read(gfs, i->indirect1, ptrs);
+        for (uint32_t p = 0; p < ppb; p++) {
+            if (ptrs[p] != IDKFS_NULL_BLOCK) {
+                bitmap_clear(&gfs->bitmap, ptrs[p]);
+                gfs->sb.free_blocks++;
+                ptrs[p] = IDKFS_NULL_BLOCK;
+            }
+        }
+        bitmap_clear(&gfs->bitmap, i->indirect1);
+        gfs->sb.free_blocks++;
+        i->indirect1 = IDKFS_NULL_BLOCK;
+    }
+
+    i->size = 0;
+    i->block_count = 0;
+    ret = idkfs_dir_remove(gfs, &gfs->inodes[parent], name);
+    if (ret < 0) return ret;
     inode_free(gfs, (uint32_t)ino);
     idkfs_flush_to_image(gfs, &g_image);
     return 0;
@@ -419,9 +418,7 @@ static const struct fuse_operations idkfs_ops = {
     .destroy  = idkfs_fuse_destroy,
 };
 
-/* ============================================================
- * MAIN
- * ============================================================ */
+
 
 static void usage(void) {
     fprintf(stderr,
@@ -434,7 +431,7 @@ static void usage(void) {
 int main(int argc, char *argv[]) {
     if (argc < 2) { usage(); return 1; }
 
-    /* --mkfs: just create the image and format it */
+
     if (strcmp(argv[1], "--mkfs") == 0) {
         if (argc < 3) { usage(); return 1; }
         if (image_create(argv[2]) < 0) return 1;
@@ -448,27 +445,34 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    /* --image <path> <mountpoint> [fuse opts] */
+
     if (strcmp(argv[1], "--image") == 0) {
         if (argc < 4) { usage(); return 1; }
         const char *image_path = argv[2];
 
         if (image_open(&g_image, image_path) < 0) return 1;
 
-        /* check if valid idkfs image */
+
         Superblock *sb = (Superblock *)g_image.map;
         bool is_new = (sb->magic != IDKFS_MAGIC);
-        if (is_new) printf("idkfs: no valid superblock found, formatting...\n");
+        if (is_new) {
+            fprintf(stderr, "idkfs: invalid or missing superblock; refusing to auto-format on mount. Run --mkfs explicitly.\n");
+            image_close(&g_image);
+            return 1;
+        }
 
-        gfs = idkfs_mount_image(&g_image, is_new);
+        gfs = idkfs_mount_image(&g_image, false);
         if (!gfs) { image_close(&g_image); return 1; }
 
-        /* rebuild fuse argv: argv[0] + mountpoint + any extra fuse opts */
-        /* shift argv so fuse sees: [prog, mountpoint, opts...] */
+#ifndef _WIN32
         argv[2] = argv[0];
         return fuse_main(argc - 2, argv + 2, &idkfs_ops, NULL);
+#endif
     }
 
     usage();
     return 1;
 }
+#else
+int idkfs_persist_host_stub;
+#endif

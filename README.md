@@ -1,126 +1,79 @@
+# IDKFS — The Sovereign Filesystem
 
-````markdown
-# IDKFS — I Don't Know Filesystem
+IDKFS (I Don't Know Filesystem) is a Linux kernel filesystem project focused on tiered placement, transactional updates, and competitive performance. The current codebase is in active migration from userspace FUSE components to a kernel-first VFS path.
 
-A fast, configurable FUSE filesystem written in C.
+##  Core Architecture
 
----
+- **Shadow-Paging CoW**: Data is never overwritten. Every write transaction creates a new version of the metadata tree, culminating in an atomic superblock generation swap.
+- **Merkle-Tree Integrity**: Every metadata node and data extent is protected by kernel-level CRC32C checksums, verified on every read cycle.
+- **Physical Zonal Tiering**: IDKFS automatically partitions your storage into FAST, NORMAL, and SLOW zones.
+    - **FAST**: Binaries, libraries (`.so`, `.bin`, `.exe`) — allocated to low-latency zones.
+    - **NORMAL**: Source code, documents, logs.
+    - **SLOW**: Archives, images (`.iso`, `.tar`, `.zip`) — allocated to high-capacity zones.
+- **Extent-Based Storage**: O(log N) lookup efficiency and minimal metadata overhead for petabyte-scale volumes.
 
-## Stack
+##  Build & Install
 
-- **C** — core: superblock, inodes, block allocator, VFS  
-- **Rust** — daemon + cross-platform layer 
-- **JS** — user config via `idkfs.config.js` 
-- **Lua** — sorting algorithms + runtime hooks 
+### 1. Requirements
+- Linux Kernel Headers
+- GCC / Make
+- `libelf-dev` (for kernel modules)
 
----
-
-## Build
-
+### 2. Compilation (Linux host)
 ```bash
-gcc -O2 -Wall -Wextra \
-    $(pkg-config --cflags --libs fuse3) \
-    $(pkg-config --cflags --libs lua) \
-    -pthread -o idkfs_fuse idkfs_fuse.c
-````
+# Build the kernel module and mkfs tool
+make
+gcc mkfs_idkfs.c -o mkfs.idkfs
+```
 
----
-
-## Usage
-
+### 3. Deployment
 ```bash
-# Create mount point
-mkdir ~/idkfs_mount
+# Prepare a 1GB image (or use a raw block device)
+truncate -s 1G idkfs.img
 
-# Mount filesystem (foreground)
-./idkfs_fuse -f ~/idkfs_mount
+# Format with IDKFS Zonal Tiering
+./mkfs.idkfs idkfs.img
 
-# Unmount
-fusermount3 -u ~/idkfs_mount
+# Load kernel modules
+sudo insmod idkfs_blk.ko backing_path=$PWD/idkfs.img
+sudo insmod idkfs_vfs.ko
+
+# Mount filesystem
+sudo mkdir -p /mnt/idkfs
+sudo mount -t idkfs idkfs.img /mnt/idkfs
 ```
 
----
-
-## Features
-
-* Speed tiers per file (FAST / NORMAL / SLOW)
-* Toggleable journaling, checksums, timestamps, compression
-* Configurable via JS (coming)
-* Lua sorting hooks driven by `sorting.lua`
-
----
-
-## Sorting
-
-`idkfs_fuse` reads `sorting.lua` from the mount directory (or the path specified in `IDKFS_SORT_SCRIPT`) and expects a `compare(a, b)` function.
-
-Each table argument contains:
-
-* `name` — filename
-* `inode` — inode number
-* `size` — file size
-* `type` — `"dir"`, `"file"`, or `"symlink"`
-
-The provided script sorts entries by **size first**, then **type**, then a **case-insensitive name compare** to ensure deterministic ordering.
-
----
-
-## System Integration
-
-### Rust Helpers
-
-* **idkfsd** — supervises the FUSE process, keeps the mount point alive, manages `<image>.snapshots/` metadata. Example:
-
+### 4. Benchmark baseline
+Run the fio harness to compare against ext4 and btrfs on the same host/device:
 ```bash
-idkfsd --image /var/lib/idkfs/myfs.img --mount /mnt/idkfs
-# Pass extra FUSE args via repeated --fuse-arg
+./bench/run_fio_matrix.sh /mnt/idkfs /mnt/ext4 /mnt/btrfs
 ```
 
-* **idkfsctl** — talks to the daemon socket and provides `create`, `list`, `delete`, and `rollback` commands:
-
+### 5. Crash-recovery smoke gate
+Build includes `idkfs_fsck` (basic superblock checks). Run the fault-injection preflight and validate image consistency:
 ```bash
-idkfsctl --socket /run/idkfsd.sock create "daily"
+./bench/fault_injection_smoke.sh /mnt/idkfs ./idkfs.img
+./idkfs_fsck ./idkfs.img
 ```
 
-Build with Cargo:
-
+### 6. POSIX canary smoke gate
+Run a minimal daily-use semantics smoke test on the mounted filesystem:
 ```bash
-cargo build --release -p idkfsd
-cargo build --release -p idkfsctl
+./bench/posix_smoke.sh /mnt/idkfs
 ```
 
----
-
-### Snapper Hooks
-
-To integrate with Snapper, point its commands at `idkfsctl`:
-
-```ini
-[config]
-CREATE_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock create \"$SNAPPER_DESCRIPTION\""
-LIST_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock list"
-DELETE_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock delete $SNAPPER_NUMBER"
-ROLLBACK_CMD="/usr/local/bin/idkfsctl --socket /run/idkfsd.sock rollback $SNAPPER_NUMBER"
+### 7. Full canary gate sequence
+Run all safety-first canary checks together:
+```bash
+./bench/canary_gate.sh /mnt/idkfs /mnt/ext4 /mnt/btrfs ./idkfs.img
 ```
 
-Snapper handles scheduling and cleanup, while the helper copies the idkfs image to/from `<image>.snapshots/`.
+##  Efficiency Mandate
 
----
+IDKFS is written in **Zero-Comment Logic-Dense C**. It prioritizes:
+1. **Instruction Cache Locality**: Minimal branches in the IO fast-path.
+2. **Lock-Free Scaling**: Uses RCU-style shadow paging and per-zone spinlocks.
+3. **No Garbage**: No background "scrubbers" required; integrity is verified at the hardware-abstraction layer.
 
-### Services (systemd & OpenRC)
-
-Deploy the unit files from `deploy/`:
-
-* `deploy/idkfsd.service` — systemd unit
-* `deploy/idkfsd.openrc` — OpenRC script
-
-Populate `/etc/idkfsd.conf`:
-
-```ini
-IDKFS_IMAGE=/var/lib/idkfs/myfs.img
-IDKFS_MOUNT=/mnt/idkfs
-```
-
-Then enable the service to let the daemon keep `idkfs` mounted automatically.
-
-
+##  License
+GPLv2 - The Sovereign Standard.
